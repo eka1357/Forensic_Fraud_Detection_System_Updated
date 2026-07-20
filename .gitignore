@@ -1,0 +1,44 @@
+# .gitignore
+
+# Data (too large for git)
+data/
+Datasets/
+*.csv
+
+# Virtual environments
+venv/
+.venv/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Environment files
+*.env
+.env
+
+# IDE
+.idea/
+.vscode/
+
+# Eggs
+*.egg-info/
+*.egg
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Streamlit
+.secrets/
+
+# Trained models (large binary files)
+models/*.pkl
+
+# Reports images (generated)
+reports/*.png
