@@ -1,62 +1,81 @@
-"""xgboost_model.py
-Supervised XGBoost classifier for fraud detection.
+"""xgboost_model.py — Supervised XGBoost classifier for fraud detection.
 
 Imbalance handling
 ------------------
-We use SMOTE to oversample the minority (fraud) class before training,
-AND set ``scale_pos_weight`` inside XGBoost as a secondary guard.
-This two-layer approach gives the classifier a balanced view while
-preserving all legitimate-transaction signal.
+We use SMOTE on training data to balance minority fraud samples and configure
+``scale_pos_weight`` inside XGBoost.
 
-Evaluation philosophy
----------------------
-Accuracy is meaningless on < 1 % fraud data (a model that always says
-"not fraud" gets 99 %+ accuracy). We focus on:
-  - **Precision** – of the ones we flag, how many are real fraud?
-  - **Recall** – of the real frauds, how many did we catch?
-  - **F1** – harmonic mean balancing the two.
-  - **PR-AUC** – precision-recall area under curve (robust to imbalance).
-
-In fraud detection, **recall usually matters more** than precision because
-missing a real fraud (false negative) is costlier than investigating a
-false alarm (false positive). However, very low precision wastes analyst
-time, so we tune for a reasonable balance.
+Decision Threshold Optimization
+-------------------------------
+In severe class imbalance (<1% fraud), the default 0.5 threshold can cause high
+false-positive rates (low precision). We optimize the decision threshold on a
+validation partition to maximize F1 / achieve a balanced precision-recall trade-off.
 """
 
+import json
+import logging
+from pathlib import Path
+from typing import Dict, Tuple, Optional
+import joblib
 import numpy as np
 import pandas as pd
-import joblib
-from pathlib import Path
 from xgboost import XGBClassifier
 from sklearn.metrics import (
     precision_recall_fscore_support,
     roc_auc_score,
     average_precision_score,
     confusion_matrix,
+    precision_recall_curve,
 )
 from imblearn.over_sampling import SMOTE
+from src.config import MODELS_DIR, XGB_MODEL_PATH, METADATA_PATH
 
-MODEL_DIR = Path(__file__).resolve().parents[2] / "models"
-MODEL_DIR.mkdir(parents=True, exist_ok=True)
-MODEL_PATH = MODEL_DIR / "xgboost_fraud.pkl"
+logger = logging.getLogger(__name__)
+
+
+def find_optimal_threshold(
+    clf: XGBClassifier, X_val: pd.DataFrame, y_val: pd.Series
+) -> float:
+    """Find the probability threshold that maximizes F1 score on validation data."""
+    probs = clf.predict_proba(X_val)[:, 1]
+    precisions, recalls, thresholds = precision_recall_curve(y_val, probs)
+
+    # Avoid division by zero
+    f1_scores = np.divide(
+        2 * (precisions * recalls),
+        (precisions + recalls),
+        out=np.zeros_like(precisions),
+        where=(precisions + recalls) > 0,
+    )
+
+    best_idx = np.argmax(f1_scores)
+    # precision_recall_curve thresholds has len(precisions) - 1
+    if best_idx < len(thresholds):
+        best_threshold = float(thresholds[best_idx])
+    else:
+        best_threshold = 0.5
+
+    logger.info(
+        f"Optimal threshold found: {best_threshold:.4f} (Val F1: {f1_scores[best_idx]:.4f})"
+    )
+    return best_threshold
 
 
 def train_xgboost(
-    X: pd.DataFrame,
-    y: pd.Series,
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
     use_smote: bool = True,
     random_state: int = 42,
 ) -> XGBClassifier:
-    """Train XGBoost with SMOTE oversampling.
+    """Train XGBoost with SMOTE oversampling on training data."""
+    MODELS_DIR.mkdir(parents=True, exist_ok=True)
 
-    Returns the fitted classifier.
-    """
-    if use_smote and y.sum() > 5:
+    if use_smote and y_train.sum() > 5:
         sm = SMOTE(sampling_strategy="auto", random_state=random_state)
-        X_res, y_res = sm.fit_resample(X, y)
-        print(f"  SMOTE: {len(X)} -> {len(X_res)} rows (balanced)")
+        X_res, y_res = sm.fit_resample(X_train, y_train)
+        logger.info(f"SMOTE applied: {len(X_train)} -> {len(X_res)} rows")
     else:
-        X_res, y_res = X, y
+        X_res, y_res = X_train, y_train
 
     pos_weight = (len(y_res) - y_res.sum()) / max(y_res.sum(), 1)
 
@@ -73,22 +92,30 @@ def train_xgboost(
         random_state=random_state,
     )
     clf.fit(X_res, y_res)
-    joblib.dump(clf, MODEL_PATH)
-    print(f"  [OK] XGBoost saved -> {MODEL_PATH}")
+    joblib.dump(clf, XGB_MODEL_PATH)
+    logger.info(f"Saved XGBoost model -> {XGB_MODEL_PATH}")
     return clf
 
 
-def evaluate_model(clf: XGBClassifier, X: pd.DataFrame, y: pd.Series) -> dict:
-    """Compute classification metrics on a held-out set."""
+def evaluate_model(
+    clf: XGBClassifier,
+    X: pd.DataFrame,
+    y: pd.Series,
+    threshold: float = 0.5,
+) -> Dict:
+    """Compute classification metrics on a held-out set using a specified threshold."""
     probs = clf.predict_proba(X)[:, 1]
-    y_pred = (probs >= 0.5).astype(int)
+    y_pred = (probs >= threshold).astype(int)
+
     precision, recall, f1, _ = precision_recall_fscore_support(
         y, y_pred, average="binary", zero_division=0
     )
     roc = roc_auc_score(y, probs)
     pr_auc = average_precision_score(y, probs)
     cm = confusion_matrix(y, y_pred)
-    return {
+
+    metrics = {
+        "threshold": round(threshold, 4),
         "precision": round(precision, 4),
         "recall": round(recall, 4),
         "f1": round(f1, 4),
@@ -96,6 +123,7 @@ def evaluate_model(clf: XGBClassifier, X: pd.DataFrame, y: pd.Series) -> dict:
         "pr_auc": round(pr_auc, 4),
         "confusion_matrix": cm.tolist(),
     }
+    return metrics
 
 
 def feature_importance(clf: XGBClassifier, feature_names: list) -> pd.DataFrame:
@@ -105,27 +133,3 @@ def feature_importance(clf: XGBClassifier, feature_names: list) -> pd.DataFrame:
         "importance": clf.feature_importances_,
     }).sort_values("importance", ascending=False).reset_index(drop=True)
     return imp
-
-
-if __name__ == "__main__":
-    import sys, os
-    sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
-
-    from src.utils.data_loader import load_processed_data
-    from src.features.feature_engineering import engineer_features, get_feature_matrix
-
-    train_df, test_df = load_processed_data()
-    train_fe = engineer_features(train_df)
-    test_fe = engineer_features(test_df)
-    X_train, y_train = get_feature_matrix(train_fe)
-    X_test, y_test = get_feature_matrix(test_fe)
-
-    clf = train_xgboost(X_train, y_train)
-    metrics = evaluate_model(clf, X_test, y_test)
-    print("\nXGBoost test metrics:")
-    for k, v in metrics.items():
-        print(f"  {k}: {v}")
-
-    imp = feature_importance(clf, list(X_train.columns))
-    print("\nTop 5 features:")
-    print(imp.head())

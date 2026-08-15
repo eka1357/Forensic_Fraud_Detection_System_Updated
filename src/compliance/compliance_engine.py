@@ -1,16 +1,26 @@
-"""compliance_engine.py
-Rule-based compliance mapping for flagged transactions.
+"""compliance_engine.py — Rule-based compliance mapping for flagged transactions.
 
-Maps risk tiers + transaction patterns to UK regulatory categories.
-This is a transparent lookup table — easy to audit and extend.
+Maps risk tiers + transaction patterns to UK regulatory categories:
+- Money Laundering Regulations 2017 (MLR 2017)
+- FCA SYSC 6.1 (Financial Crime Systems and Controls)
+- Proceeds of Crime Act 2002 (POCA 2002)
+- Payment Services Regulations 2017 (PSR 2017)
 
-DISCLAIMER: This is illustrative for portfolio / interview purposes.
-It is NOT legal or compliance advice and should not be used as such.
+DISCLAIMER: This mapping layer is illustrative for demonstration and portfolio purposes.
+It does NOT constitute legal or regulatory compliance advice.
 """
 
-from typing import List, Dict
+import logging
+from typing import List, Dict, Any
+from src.config import (
+    COMPLIANCE_HIGH_AMOUNT_THRESHOLD,
+    COMPLIANCE_UNUSUAL_HOUR_START,
+    COMPLIANCE_UNUSUAL_HOUR_END,
+)
 
-# ── Regulatory category definitions ──────────────────────────────────
+logger = logging.getLogger(__name__)
+
+# Regulatory category definitions
 REGULATIONS = {
     "MLR2017": {
         "name": "Money Laundering Regulations 2017",
@@ -19,72 +29,67 @@ REGULATIONS = {
     },
     "FCA_SYSC": {
         "name": "FCA SYSC 6.1 – Financial Crime",
-        "description": "Systems and controls requirement under FCA's Senior Management Arrangements.",
+        "description": "Systems and controls requirement under FCA Senior Management Arrangements.",
     },
     "POCA2002": {
         "name": "Proceeds of Crime Act 2002",
-        "description": "Potential obligation to file a SAR with the NCA under POCA s.330-332.",
+        "description": "Potential obligation to file a SAR with the National Crime Agency (NCA) under POCA s.330-332.",
     },
     "PSR2017": {
         "name": "Payment Services Regulations 2017",
-        "description": "Strong Customer Authentication and fraud monitoring obligations.",
+        "description": "Strong Customer Authentication and fraud monitoring obligations under PSR 2017.",
     },
 }
 
 
-# ── Pattern detectors ────────────────────────────────────────────────
-def _is_high_amount(tx: Dict) -> bool:
-    """Transaction amount exceeds a notable threshold."""
-    return tx.get("amt", 0) > 5000
+def _is_high_amount(tx: Dict[str, Any]) -> bool:
+    """Check if transaction amount exceeds high-amount threshold (£5,000)."""
+    return float(tx.get("amt", 0.0) or 0.0) >= COMPLIANCE_HIGH_AMOUNT_THRESHOLD
 
 
-def _is_rapid_succession(tx: Dict) -> bool:
-    """Placeholder for detecting structuring / smurfing patterns.
-    In production this would check transaction velocity per account.
-    """
-    return False  # not enough context in a single-row call
+def _is_unusual_hour(tx: Dict[str, Any]) -> bool:
+    """Check if transaction occurred during off-peak hours (midnight to 5 AM)."""
+    try:
+        hour = int(tx.get("hour", 12))
+        return COMPLIANCE_UNUSUAL_HOUR_START <= hour < COMPLIANCE_UNUSUAL_HOUR_END
+    except (ValueError, TypeError):
+        return False
 
 
-def _is_unusual_hour(tx: Dict) -> bool:
-    """Transaction occurred between midnight and 5 AM."""
-    hour = tx.get("hour", 12)
-    return 0 <= hour < 5
-
-
-# ── Main mapping function ───────────────────────────────────────────
-def get_compliance_flags(risk_tier: str, transaction: Dict) -> List[Dict]:
+def get_compliance_flags(risk_tier: str, transaction: Dict[str, Any]) -> List[Dict[str, str]]:
     """Return applicable regulatory triggers for a transaction.
 
     Parameters
     ----------
     risk_tier : "Low", "Medium", or "High"
-    transaction : dict of transaction features
+    transaction : dict of transaction features (e.g. amt, hour, category)
 
     Returns
     -------
     List of dicts, each with keys ``regulation``, ``name``, ``reason``.
     """
-    flags: List[Dict] = []
+    flags: List[Dict[str, str]] = []
 
     if risk_tier == "High":
         flags.append({
             "regulation": "MLR2017",
             "name": REGULATIONS["MLR2017"]["name"],
-            "reason": "Transaction flagged as high-risk by ensemble model — "
-                      "SAR consideration required.",
+            "reason": "Transaction flagged as high-risk by multi-signal ensemble model — "
+                      "SAR consideration required under MLR 2017.",
         })
         flags.append({
             "regulation": "POCA2002",
             "name": REGULATIONS["POCA2002"]["name"],
-            "reason": "Potential proceeds-of-crime trigger due to high risk score.",
+            "reason": "Potential proceeds-of-crime trigger due to high risk score — review for NCA reporting.",
         })
 
     if risk_tier in ("Medium", "High") and _is_high_amount(transaction):
+        amt_val = float(transaction.get("amt", 0.0) or 0.0)
         flags.append({
             "regulation": "FCA_SYSC",
             "name": REGULATIONS["FCA_SYSC"]["name"],
-            "reason": f"Medium/high-risk transaction with elevated amount "
-                      f"(${transaction.get('amt', '?'):.2f}) requires enhanced monitoring.",
+            "reason": f"Elevated-risk transaction with high amount "
+                      f"(£{amt_val:,.2f}) requires enhanced due diligence under FCA SYSC 6.1.",
         })
 
     if risk_tier in ("Medium", "High") and _is_unusual_hour(transaction):
@@ -92,26 +97,14 @@ def get_compliance_flags(risk_tier: str, transaction: Dict) -> List[Dict]:
             "regulation": "PSR2017",
             "name": REGULATIONS["PSR2017"]["name"],
             "reason": "Unusual transaction hour combined with elevated risk — "
-                      "SCA / fraud-monitoring review.",
+                      "Strong Customer Authentication (SCA) & monitoring review under PSR 2017.",
         })
 
     return flags
 
 
-def format_flags_text(flags: List[Dict]) -> str:
-    """Human-readable one-liner for dashboard display."""
+def format_flags_text(flags: List[Dict[str, str]]) -> str:
+    """Format compliance triggers into a clean human-readable summary."""
     if not flags:
         return "No regulatory triggers"
     return "; ".join(f"{f['name']}: {f['reason']}" for f in flags)
-
-
-if __name__ == "__main__":
-    demo = {"amt": 9500, "hour": 2}
-    for tier in ["Low", "Medium", "High"]:
-        result = get_compliance_flags(tier, demo)
-        print(f"\n{tier} risk →")
-        if result:
-            for f in result:
-                print(f"  [{f['regulation']}] {f['reason']}")
-        else:
-            print("  No triggers")

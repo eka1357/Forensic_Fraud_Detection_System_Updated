@@ -1,23 +1,25 @@
-"""eda.py
-Exploratory data-analysis helpers for the Sparkov fraud-simulation dataset.
-"""
+"""eda.py — Exploratory data-analysis helpers for the Sparkov fraud-simulation dataset."""
 
+import logging
 import pandas as pd
 import numpy as np
 import matplotlib
-matplotlib.use("Agg")          # headless backend for CI / scripts
+matplotlib.use("Agg")  # headless backend for CI / scripts
 import matplotlib.pyplot as plt
 import seaborn as sns
 from pathlib import Path
+from typing import Dict, Optional
+from src.config import REPORTS_DIR
 
-REPORTS_DIR = Path(__file__).resolve().parents[2] / "reports"
+logger = logging.getLogger(__name__)
 
 
-# ── helpers ──────────────────────────────────────────────────────────
-def class_balance(df: pd.DataFrame, label_col: str = "is_fraud") -> dict:
+def class_balance(df: pd.DataFrame, label_col: str = "is_fraud") -> Dict:
     """Return counts and percentages per class."""
+    if label_col not in df.columns:
+        return {"counts": {}, "percentages": {}}
     counts = df[label_col].value_counts().to_dict()
-    total = len(df)
+    total = max(len(df), 1)
     pcts = {k: round(v / total * 100, 4) for k, v in counts.items()}
     return {"counts": counts, "percentages": pcts}
 
@@ -25,7 +27,7 @@ def class_balance(df: pd.DataFrame, label_col: str = "is_fraud") -> dict:
 def amount_distribution(df: pd.DataFrame, amount_col: str = "amt"):
     """Histogram of transaction amounts (log y-scale). Returns the figure."""
     fig, ax = plt.subplots(figsize=(9, 4))
-    sns.histplot(df[amount_col], bins=60, kde=True, ax=ax)
+    sns.histplot(df[amount_col], bins=60, kde=True, ax=ax, color="steelblue")
     ax.set_yscale("log")
     ax.set_title("Transaction Amount Distribution")
     ax.set_xlabel("Amount ($)")
@@ -36,7 +38,7 @@ def amount_distribution(df: pd.DataFrame, amount_col: str = "amt"):
 
 def fraud_by_category(df: pd.DataFrame):
     """Bar chart of fraud rate by merchant category. Returns the figure."""
-    if "category" not in df.columns:
+    if "category" not in df.columns or "is_fraud" not in df.columns:
         return None
     rates = df.groupby("category")["is_fraud"].mean().sort_values(ascending=False)
     fig, ax = plt.subplots(figsize=(10, 5))
@@ -49,16 +51,17 @@ def fraud_by_category(df: pd.DataFrame):
 
 def time_patterns(df: pd.DataFrame):
     """Fraud rate by hour of day. Returns the figure."""
+    if "is_fraud" not in df.columns:
+        return None
     tmp = df.copy()
     if "trans_date_trans_time" in tmp.columns:
         tmp["trans_date_trans_time"] = pd.to_datetime(
             tmp["trans_date_trans_time"], errors="coerce"
         )
         tmp["hour"] = tmp["trans_date_trans_time"].dt.hour
-    elif "hour" in tmp.columns:
-        pass
-    else:
+    elif "hour" not in tmp.columns:
         return None
+
     hourly = tmp.groupby("hour")["is_fraud"].mean()
     fig, ax = plt.subplots(figsize=(8, 4))
     hourly.plot(kind="bar", ax=ax, color="steelblue")
@@ -69,7 +72,6 @@ def time_patterns(df: pd.DataFrame):
     return fig
 
 
-# ── report generator ─────────────────────────────────────────────────
 def generate_eda_report(train_df: pd.DataFrame, test_df: pd.DataFrame):
     """Create an EDA markdown report and save figures to /reports."""
     REPORTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -141,4 +143,4 @@ def generate_eda_report(train_df: pd.DataFrame, test_df: pd.DataFrame):
 transaction data.*
 """
     (REPORTS_DIR / "eda_report.md").write_text(md, encoding="utf-8")
-    print("EDA report and figures saved to", REPORTS_DIR)
+    logger.info(f"EDA report and figures saved to {REPORTS_DIR}")

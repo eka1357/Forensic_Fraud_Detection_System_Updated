@@ -1,0 +1,89 @@
+{
+  "optimal_threshold": 0.9789804220199585,
+  "test_metrics_calibrated": {
+    "threshold": 0.979,
+    "precision": 0.8258,
+    "recall": 0.5725,
+    "f1": 0.6762,
+    "roc_auc": 0.9796,
+    "pr_auc": 0.7019,
+    "confusion_matrix": [
+      [
+        553315,
+        259
+      ],
+      [
+        917,
+        1228
+      ]
+    ]
+  },
+  "test_metrics_default": {
+    "threshold": 0.5,
+    "precision": 0.0927,
+    "recall": 0.8839,
+    "f1": 0.1679,
+    "roc_auc": 0.9796,
+    "pr_auc": 0.7019,
+    "confusion_matrix": [
+      [
+        535025,
+        18549
+      ],
+      [
+        249,
+        1896
+      ]
+    ]
+  },
+  "top_features": [
+    {
+      "feature": "amt",
+      "importance": 0.41029688715934753
+    },
+    {
+      "feature": "amt_log",
+      "importance": 0.20390494167804718
+    },
+    {
+      "feature": "benford_score",
+      "importance": 0.12032268941402435
+    },
+    {
+      "feature": "hour",
+      "importance": 0.09761416167020798
+    },
+    {
+      "feature": "category_code",
+      "importance": 0.0670197606086731
+    },
+    {
+      "feature": "dayofweek",
+      "importance": 0.04675956442952156
+    },
+    {
+      "feature": "city_pop",
+      "importance": 0.014516153372824192
+    },
+    {
+      "feature": "distance",
+      "importance": 0.012340203858911991
+    },
+    {
+      "feature": "lat",
+      "importance": 0.009422083385288715
+    },
+    {
+      "feature": "long",
+      "importance": 0.008485239930450916
+    },
+    {
+      "feature": "merch_long",
+      "importance": 0.004803637508302927
+    },
+    {
+      "feature": "merch_lat",
+      "importance": 0.004514707252383232
+    }
+  ]
+}

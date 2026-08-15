@@ -1,45 +1,60 @@
-"""ensemble.py
-Combine Isolation Forest + XGBoost + Benford scores into one risk score.
+"""ensemble.py — Combine Isolation Forest + XGBoost + Benford scores into one risk score.
 
 Combination logic
 -----------------
 We use a weighted average of three normalised (0-1) signals:
-
-  * **XGBoost fraud probability** (weight 0.50) – strongest supervised signal
-  * **Isolation Forest anomaly score** (weight 0.30) – unsupervised outlier
+  * **XGBoost fraud probability** (weight 0.50) – supervised signal
+  * **Isolation Forest anomaly score** (weight 0.30) – unsupervised outlier signal
   * **Benford deviation score** (weight 0.20) – forensic accounting signal
 
-We weight XGBoost highest because it has seen labels and achieves the best
-PR-AUC. Isolation Forest adds value for novel fraud patterns that the
-supervised model hasn't learned. Benford catches numeric fabrication.
-
-Risk tiers are defined by percentile thresholds:
-  * **Low**    – bottom 90 %
+Risk tiers:
+  * **Low**    – bottom 90%
   * **Medium** – 90th – 97th percentile
-  * **High**   – top 3 %
+  * **High**   – top 3%
 """
 
+import logging
+from pathlib import Path
+from typing import Dict, Optional
+import joblib
 import numpy as np
 import pandas as pd
-import joblib
-from pathlib import Path
+from src.config import (
+    ISO_MODEL_PATH,
+    XGB_MODEL_PATH,
+    W_XGB,
+    W_ISO,
+    W_BEN,
+    TIER_P90,
+    TIER_P97,
+)
 
-BASE_DIR = Path(__file__).resolve().parents[2]
-ISO_MODEL_PATH = BASE_DIR / "models" / "isolation_forest.pkl"
-XGB_MODEL_PATH = BASE_DIR / "models" / "xgboost_fraud.pkl"
-
-# Weights for the three signals
-W_XGB = 0.50
-W_ISO = 0.30
-W_BEN = 0.20
+logger = logging.getLogger(__name__)
 
 
 def _minmax(s: pd.Series) -> pd.Series:
-    """Min-max normalise to [0, 1]. Returns zeros for constant series."""
+    """Min-max normalise series to [0, 1]. Returns zeros for constant series."""
     lo, hi = s.min(), s.max()
-    if hi == lo:
-        return pd.Series(0.0, index=s.index)
-    return (s - lo) / (hi - lo)
+    if np.isnan(lo) or np.isnan(hi) or hi == lo:
+        return pd.Series(0.0, index=s.index, dtype=float)
+    return ((s - lo) / (hi - lo)).astype(float)
+
+
+def load_models() -> tuple:
+    """Load Isolation Forest and XGBoost model artifacts safely."""
+    if not ISO_MODEL_PATH.exists():
+        raise FileNotFoundError(
+            f"Isolation Forest model not found at {ISO_MODEL_PATH}. "
+            "Please train the model first by running the pipeline."
+        )
+    if not XGB_MODEL_PATH.exists():
+        raise FileNotFoundError(
+            f"XGBoost model not found at {XGB_MODEL_PATH}. "
+            "Please train the model first by running the pipeline."
+        )
+    iso_model = joblib.load(ISO_MODEL_PATH)
+    xgb_model = joblib.load(XGB_MODEL_PATH)
+    return iso_model, xgb_model
 
 
 def compute_ensemble(
@@ -55,10 +70,10 @@ def compute_ensemble(
     iso_model : pre-loaded IsolationForest (loaded from disk if None).
     xgb_model : pre-loaded XGBClassifier (loaded from disk if None).
     """
-    if iso_model is None:
-        iso_model = joblib.load(ISO_MODEL_PATH)
-    if xgb_model is None:
-        xgb_model = joblib.load(XGB_MODEL_PATH)
+    if iso_model is None or xgb_model is None:
+        loaded_iso, loaded_xgb = load_models()
+        iso_model = iso_model or loaded_iso
+        xgb_model = xgb_model or loaded_xgb
 
     # 1. Isolation Forest score (higher = more anomalous)
     iso_raw = pd.Series(-iso_model.decision_function(X), index=X.index)
@@ -80,19 +95,17 @@ def compute_ensemble(
     result = X.copy()
     result["risk_score"] = combined
 
-    # Tier thresholds (percentile-based)
-    p90 = combined.quantile(0.90)
-    p97 = combined.quantile(0.97)
+    # Vectorized Tier Assignment using percentiles
+    p90 = float(combined.quantile(TIER_P90))
+    p97 = float(combined.quantile(TIER_P97))
 
-    def _tier(score):
-        if score >= p97:
-            return "High"
-        elif score >= p90:
-            return "Medium"
-        else:
-            return "Low"
+    conditions = [
+        combined >= p97,
+        (combined >= p90) & (combined < p97),
+    ]
+    choices = ["High", "Medium"]
+    result["risk_tier"] = np.select(conditions, choices, default="Low")
 
-    result["risk_tier"] = combined.apply(_tier)
     return result
 
 
@@ -102,23 +115,5 @@ def score_single_transaction(row: dict, iso_model=None, xgb_model=None) -> dict:
     scored = compute_ensemble(df, iso_model, xgb_model)
     return {
         "risk_score": float(scored["risk_score"].iloc[0]),
-        "risk_tier": scored["risk_tier"].iloc[0],
+        "risk_tier": str(scored["risk_tier"].iloc[0]),
     }
-
-
-if __name__ == "__main__":
-    import sys, os
-    sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
-
-    from src.utils.data_loader import load_processed_data
-    from src.features.feature_engineering import engineer_features, get_feature_matrix
-
-    train_df, _ = load_processed_data()
-    train_fe = engineer_features(train_df)
-    X, y = get_feature_matrix(train_fe)
-
-    result = compute_ensemble(X)
-    print("Risk tier distribution:")
-    print(result["risk_tier"].value_counts())
-    print("\nSample high-risk transactions:")
-    print(result.sort_values("risk_score", ascending=False).head(5)[["risk_score", "risk_tier"]])

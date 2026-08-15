@@ -1,190 +1,243 @@
-"""run_pipeline.py -- Run the full forensic fraud detection pipeline.
+"""run_pipeline.py — Master runner for the Forensic Fraud Detection Pipeline.
 
-Usage:
-    python src/pipeline/run_pipeline.py
-
-This script executes all phases sequentially:
+Executes:
   Phase 1: Data loading & cleaning
-  Phase 2: Benford's Law scoring (tested via unit tests)
-  Phase 3: Feature engineering
-  Phase 4: Isolation Forest training
-  Phase 5: XGBoost training & evaluation
-  Phase 6: Ensemble risk scoring
-  Phase 7: Compliance flag mapping
+  Phase 2: Benford's Law module sanity checks
+  Phase 3: Feature engineering with consistent categorical mapping
+  Phase 4: Isolation Forest unsupervised training
+  Phase 5: XGBoost training (SMOTE on train, threshold calibration on validation, final test eval)
+  Phase 6: Multi-signal ensemble risk scoring
+  Phase 7: UK regulatory compliance flag mapping
 """
 
-import sys, os, time
-PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-sys.path.insert(0, PROJECT_ROOT)
-
-import pandas as pd
+import json
+import logging
+import time
+from pathlib import Path
 import numpy as np
+import pandas as pd
+from sklearn.model_selection import train_test_split
+
+from src.config import (
+    REPORTS_DIR,
+    MODELS_DIR,
+    METADATA_PATH,
+    ISO_CONTAMINATION,
+    LABEL_COL,
+)
+from src.utils.data_loader import prepare_data, load_processed_data
+from src.utils.eda import generate_eda_report
+from src.features.benford import benford_chi2
+from src.features.feature_engineering import engineer_features, get_feature_matrix
+from src.models.isolation_forest_model import (
+    train_isolation_forest,
+    get_anomaly_scores,
+    evaluate_against_labels,
+)
+from src.models.xgboost_model import (
+    train_xgboost,
+    find_optimal_threshold,
+    evaluate_model,
+    feature_importance,
+)
+from src.models.ensemble import compute_ensemble
+from src.compliance.compliance_engine import get_compliance_flags, format_flags_text
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%H:%M:%S",
+)
+logger = logging.getLogger("pipeline")
 
 
 def phase1():
-    """Data loading & cleaning."""
-    print("=" * 60)
-    print("Phase 1 -- Data Understanding & Cleaning")
-    print("=" * 60)
-    from src.utils.data_loader import prepare_data, load_processed_data
-    from src.utils.eda import generate_eda_report
+    """Phase 1: Data Understanding & Cleaning."""
+    logger.info("=" * 60)
+    logger.info("Phase 1 — Data Understanding & Cleaning")
+    logger.info("=" * 60)
 
     train_path, test_path = prepare_data()
-    print(f"  [OK] Processed train -> {train_path}")
-    print(f"  [OK] Processed test  -> {test_path}")
+    logger.info(f"Processed train saved -> {train_path}")
+    logger.info(f"Processed test saved  -> {test_path}")
 
     train_df, test_df = load_processed_data()
     generate_eda_report(train_df, test_df)
-    print("  [OK] EDA report generated")
-
     fraud_rate = train_df["is_fraud"].mean()
-    print(f"  [OK] Training fraud rate: {fraud_rate:.4%}")
-    print()
+    logger.info(f"Training fraud rate: {fraud_rate:.4%}")
     return train_df, test_df
 
 
 def phase2():
-    """Benford's Law module (tested separately via pytest)."""
-    print("=" * 60)
-    print("Phase 2 -- Benford's Law Module")
-    print("=" * 60)
-    from src.features.benford import benford_chi2
-    # Quick sanity check
+    """Phase 2: Benford's Law Module."""
+    logger.info("=" * 60)
+    logger.info("Phase 2 — Benford's Law Module")
+    logger.info("=" * 60)
+
     sample = pd.Series([1, 2, 3, 4, 5, 6, 7, 8, 9] * 100)
     score = benford_chi2(sample)
-    print(f"  [OK] Benford module loaded. Sanity chi2 on uniform digits: {score:.1f}")
-    print("    (Run `pytest tests/test_benford.py -v` for full unit tests)")
-    print()
+    logger.info(f"Benford module initialized. Uniform digits chi2: {score:.1f}")
 
 
-def phase3(train_df, test_df):
-    """Feature engineering."""
-    print("=" * 60)
-    print("Phase 3 -- Feature Engineering")
-    print("=" * 60)
-    from src.features.feature_engineering import engineer_features, get_feature_matrix
+def phase3(train_df: pd.DataFrame, test_df: pd.DataFrame):
+    """Phase 3: Feature Engineering with Train/Validation partition."""
+    logger.info("=" * 60)
+    logger.info("Phase 3 — Feature Engineering")
+    logger.info("=" * 60)
 
     train_fe = engineer_features(train_df)
     test_fe = engineer_features(test_df)
-    X_train, y_train = get_feature_matrix(train_fe)
+
+    X_train_full, y_train_full = get_feature_matrix(train_fe)
     X_test, y_test = get_feature_matrix(test_fe)
 
-    print(f"  [OK] Training features: {X_train.shape}")
-    print(f"  [OK] Test features:     {X_test.shape}")
-    print(f"  [OK] Feature columns:   {list(X_train.columns)}")
-    print("  [OK] Imbalance strategy: SMOTE + class weights (documented in feature_engineering.py)")
-    print()
-    return X_train, y_train, X_test, y_test
-
-
-def phase4(X_train):
-    """Isolation Forest."""
-    print("=" * 60)
-    print("Phase 4 -- Isolation Forest (Unsupervised)")
-    print("=" * 60)
-    from src.models.isolation_forest_model import (
-        train_isolation_forest, get_anomaly_scores, evaluate_against_labels,
+    # Create an 80/20 train/validation split for threshold tuning and hyperparameter checks
+    X_train, X_val, y_train, y_val = train_test_split(
+        X_train_full,
+        y_train_full,
+        test_size=0.20,
+        random_state=42,
+        stratify=y_train_full,
     )
 
-    model = train_isolation_forest(X_train, contamination=0.006)
+    logger.info(f"Train split:      {X_train.shape} (Fraud: {y_train.mean():.4%})")
+    logger.info(f"Validation split: {X_val.shape} (Fraud: {y_val.mean():.4%})")
+    logger.info(f"Test split:       {X_test.shape} (Fraud: {y_test.mean():.4%})")
+    logger.info(f"Feature columns:  {list(X_train.columns)}")
+    return X_train, y_train, X_val, y_val, X_test, y_test
+
+
+def phase4(X_train: pd.DataFrame, y_train: pd.Series):
+    """Phase 4: Isolation Forest (Unsupervised)."""
+    logger.info("=" * 60)
+    logger.info("Phase 4 — Isolation Forest (Unsupervised)")
+    logger.info("=" * 60)
+
+    model = train_isolation_forest(X_train, contamination=ISO_CONTAMINATION)
     scores = get_anomaly_scores(model, X_train)
-    print(f"  [OK] Anomaly scores: min={scores.min():.3f}, max={scores.max():.3f}")
-    print("  [OK] Contamination set to 0.006 (~0.6%) to match observed fraud rate.")
-    print()
+    metrics = evaluate_against_labels(scores, y_train.values)
+    logger.info(f"Isolation Forest sanity ROC-AUC: {metrics['roc_auc']}, PR-AUC: {metrics['pr_auc']}")
     return model
 
 
-def phase5(X_train, y_train, X_test, y_test):
-    """XGBoost."""
-    print("=" * 60)
-    print("Phase 5 -- XGBoost (Supervised)")
-    print("=" * 60)
-    from src.models.xgboost_model import train_xgboost, evaluate_model, feature_importance
+def phase5(
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
+    X_val: pd.DataFrame,
+    y_val: pd.Series,
+    X_test: pd.DataFrame,
+    y_test: pd.Series,
+):
+    """Phase 5: XGBoost with validation threshold calibration."""
+    logger.info("=" * 60)
+    logger.info("Phase 5 — XGBoost (Supervised)")
+    logger.info("=" * 60)
 
     clf = train_xgboost(X_train, y_train, use_smote=True)
-    metrics = evaluate_model(clf, X_test, y_test)
-    print("  [OK] Test metrics:")
-    for k, v in metrics.items():
-        if k != "confusion_matrix":
-            print(f"      {k}: {v}")
-    print(f"      confusion_matrix: {metrics['confusion_matrix']}")
+
+    # Calibrate decision threshold on validation set
+    optimal_thresh = find_optimal_threshold(clf, X_val, y_val)
+    logger.info(f"Calibrated optimal decision threshold: {optimal_thresh:.4f}")
+
+    # Evaluate on unseen test set using both default 0.5 and calibrated threshold
+    metrics_default = evaluate_model(clf, X_test, y_test, threshold=0.5)
+    metrics_optimal = evaluate_model(clf, X_test, y_test, threshold=optimal_thresh)
+
+    logger.info(f"Test Metrics (Default 0.50 Threshold):")
+    logger.info(f"  Precision: {metrics_default['precision']}, Recall: {metrics_default['recall']}, F1: {metrics_default['f1']}")
+    logger.info(f"Test Metrics (Calibrated {optimal_thresh:.4f} Threshold):")
+    logger.info(f"  Precision: {metrics_optimal['precision']}, Recall: {metrics_optimal['recall']}, F1: {metrics_optimal['f1']}")
+    logger.info(f"  ROC-AUC:   {metrics_optimal['roc_auc']}, PR-AUC: {metrics_optimal['pr_auc']}")
 
     imp = feature_importance(clf, list(X_train.columns))
-    print("  [OK] Top 5 features:")
-    for _, row in imp.head().iterrows():
-        print(f"      {row['feature']}: {row['importance']:.4f}")
-    print()
 
-    # Save metrics to reports
-    from pathlib import Path
-    reports_dir = Path(PROJECT_ROOT) / "reports"
-    reports_dir.mkdir(exist_ok=True)
-    with open(reports_dir / "model_metrics.md", "w", encoding="utf-8") as f:
-        f.write("# Model Evaluation Metrics\n\n")
-        f.write("## XGBoost (Test Set)\n")
-        f.write("| Metric | Value |\n|--------|-------|\n")
-        for k, v in metrics.items():
-            if k != "confusion_matrix":
-                f.write(f"| {k} | {v} |\n")
-        f.write(f"\n### Confusion Matrix\n```\n{metrics['confusion_matrix']}\n```\n")
-        f.write("\n### Feature Importance (Top 5)\n")
-        f.write("| Feature | Importance |\n|---------|------------|\n")
-        for _, row in imp.head().iterrows():
-            f.write(f"| {row['feature']} | {row['importance']:.4f} |\n")
-    print("  [OK] Metrics saved -> reports/model_metrics.md")
-    print()
-    return clf
+    # Save metrics report
+    REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+    report_content = f"""# Model Evaluation Metrics
+
+## XGBoost (Held-Out Test Set)
+
+### Performance Comparison
+
+| Metric | Default (0.50 Threshold) | Calibrated ({optimal_thresh:.4f} Threshold) |
+|--------|--------------------------|---------------------------------------------|
+| **Precision** | {metrics_default['precision']:.4f} | **{metrics_optimal['precision']:.4f}** |
+| **Recall** | {metrics_default['recall']:.4f} | **{metrics_optimal['recall']:.4f}** |
+| **F1-Score** | {metrics_default['f1']:.4f} | **{metrics_optimal['f1']:.4f}** |
+| **ROC-AUC** | {metrics_default['roc_auc']:.4f} | **{metrics_optimal['roc_auc']:.4f}** |
+| **PR-AUC** | {metrics_default['pr_auc']:.4f} | **{metrics_optimal['pr_auc']:.4f}** |
+
+### Confusion Matrix (Calibrated Threshold)
+```
+{metrics_optimal['confusion_matrix']}
+```
+
+### Feature Importance (Top Features)
+| Feature | Importance |
+|---------|------------|
+"""
+    for _, row in imp.head(8).iterrows():
+        report_content += f"| `{row['feature']}` | {row['importance']:.4f} |\n"
+
+    (REPORTS_DIR / "model_metrics.md").write_text(report_content, encoding="utf-8")
+    logger.info("Saved model metrics -> reports/model_metrics.md")
+
+    # Save pipeline metadata
+    metadata = {
+        "optimal_threshold": optimal_thresh,
+        "test_metrics_calibrated": metrics_optimal,
+        "test_metrics_default": metrics_default,
+        "top_features": imp.to_dict(orient="records"),
+    }
+    with open(METADATA_PATH, "w", encoding="utf-8") as f:
+        json.dump(metadata, f, indent=2)
+
+    return clf, optimal_thresh
 
 
-def phase6(X_test):
-    """Ensemble scoring."""
-    print("=" * 60)
-    print("Phase 6 -- Ensemble Risk Scoring")
-    print("=" * 60)
-    from src.models.ensemble import compute_ensemble
+def phase6(X_test: pd.DataFrame, iso_model, xgb_model):
+    """Phase 6: Multi-signal Ensemble Scoring."""
+    logger.info("=" * 60)
+    logger.info("Phase 6 — Ensemble Risk Scoring")
+    logger.info("=" * 60)
 
-    result = compute_ensemble(X_test)
+    result = compute_ensemble(X_test, iso_model=iso_model, xgb_model=xgb_model)
     tier_dist = result["risk_tier"].value_counts()
-    print("  [OK] Risk tier distribution (test set):")
     for tier in ["Low", "Medium", "High"]:
-        count = tier_dist.get(tier, 0)
-        print(f"      {tier}: {count:,}")
-    print()
+        logger.info(f"  {tier} Risk: {tier_dist.get(tier, 0):,}")
     return result
 
 
-def phase7(result):
-    """Compliance mapping."""
-    print("=" * 60)
-    print("Phase 7 -- Compliance Engine")
-    print("=" * 60)
-    from src.compliance.compliance_engine import get_compliance_flags, format_flags_text
+def phase7(scored_df: pd.DataFrame):
+    """Phase 7: Compliance Mapping."""
+    logger.info("=" * 60)
+    logger.info("Phase 7 — Compliance Engine")
+    logger.info("=" * 60)
 
-    high_risk = result[result["risk_tier"] == "High"].head(5)
-    print("  [OK] Sample compliance flags for top 5 high-risk transactions:")
-    for i, (_, row) in enumerate(high_risk.iterrows()):
+    high_risk_samples = scored_df[scored_df["risk_tier"] == "High"].head(5)
+    for i, (_, row) in enumerate(high_risk_samples.iterrows(), start=1):
         flags = get_compliance_flags(row["risk_tier"], row.to_dict())
-        print(f"    Transaction {i+1}: {format_flags_text(flags)}")
-    print()
+        logger.info(f"Sample High-Risk #{i} (£{row.get('amt', 0):.2f}): {format_flags_text(flags)}")
 
 
 def main():
     start = time.time()
-    print("\n>>> FORENSIC FRAUD DETECTION PIPELINE <<<\n")
+    logger.info(">>> STARTING FORENSIC FRAUD DETECTION PIPELINE <<<")
 
     train_df, test_df = phase1()
     phase2()
-    X_train, y_train, X_test, y_test = phase3(train_df, test_df)
-    phase4(X_train)
-    phase5(X_train, y_train, X_test, y_test)
-    result = phase6(X_test)
-    phase7(result)
+    X_train, y_train, X_val, y_val, X_test, y_test = phase3(train_df, test_df)
+    iso_model = phase4(X_train, y_train)
+    xgb_model, threshold = phase5(X_train, y_train, X_val, y_val, X_test, y_test)
+    scored_test = phase6(X_test, iso_model, xgb_model)
+    phase7(scored_test)
 
     elapsed = time.time() - start
-    print("=" * 60)
-    print(f"[DONE] Pipeline complete in {elapsed:.1f}s")
-    print("   Run `streamlit run app/streamlit_app.py` to launch the dashboard.")
-    print("=" * 60)
+    logger.info("=" * 60)
+    logger.info(f"[SUCCESS] Full Pipeline Completed in {elapsed:.1f}s")
+    logger.info("Launch dashboard: streamlit run app/streamlit_app.py")
+    logger.info("=" * 60)
 
 
 if __name__ == "__main__":

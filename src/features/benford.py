@@ -1,5 +1,4 @@
-"""benford.py
-Benford's Law deviation scoring for transaction amounts.
+"""benford.py — Benford's Law deviation scoring for transaction amounts.
 
 Why it matters for fraud detection
 ----------------------------------
@@ -9,9 +8,12 @@ distribution predicted by Benford's Law. A high chi-square score signals
 that a group of transactions has an unnatural leading-digit pattern.
 """
 
+import logging
 import numpy as np
 import pandas as pd
 from scipy.stats import chisquare
+
+logger = logging.getLogger(__name__)
 
 # Benford expected proportions for digits 1-9
 BENFORD_EXPECTED = np.log10(1 + 1 / np.arange(1, 10))
@@ -21,6 +23,9 @@ def leading_digit(series: pd.Series) -> pd.Series:
     """Extract the leading digit (1-9) from each positive value.
     Non-positive values become NaN.
     """
+    if series.empty:
+        return pd.Series(dtype=float)
+    # Convert series to positive numeric values, drop non-positive
     positive = series[series > 0].astype(str).str.replace(".", "", n=1)
     # strip leading zeros that appear after decimal removal
     digits = positive.str.lstrip("0").str[0].astype(float)
@@ -36,6 +41,9 @@ def benford_chi2(series: pd.Series) -> float:
         return 0.0
     obs_counts = np.bincount(digits.astype(int), minlength=10)[1:]  # digits 1-9
     expected_counts = BENFORD_EXPECTED * len(digits)
+    # If any expected count is 0, return 0.0
+    if np.any(expected_counts == 0):
+        return 0.0
     chi2, _ = chisquare(f_obs=obs_counts, f_exp=expected_counts)
     return float(chi2)
 
@@ -47,18 +55,25 @@ def benford_deviation_per_row(
 ) -> pd.Series:
     """Per-transaction Benford deviation score.
 
-    We compute the chi-square score *per group* (e.g. merchant category)
-    and assign it to every transaction in that group. This way each
-    transaction inherits the anomaly level of its group.
+    Computes the chi-square score per group (e.g. merchant category) efficiently
+    using groupby.apply() and maps it back to each row, avoiding redundant N-row
+    transform computations.
 
     If ``group_col`` is missing, a single global score is used.
     """
+    if df.empty or amount_col not in df.columns:
+        return pd.Series(0.0, index=df.index)
+
     if group_col in df.columns:
-        scores = df.groupby(group_col)[amount_col].transform(benford_chi2)
+        # Performance optimization: compute chi2 once per unique category (~14 calls)
+        # rather than once per row (~1.3 million calls with .transform())
+        group_scores = df.groupby(group_col)[amount_col].apply(benford_chi2)
+        scores = df[group_col].map(group_scores).fillna(0.0)
     else:
         global_score = benford_chi2(df[amount_col])
         scores = pd.Series(global_score, index=df.index)
-    return scores
+
+    return scores.astype(float)
 
 
 def add_benford_score(
